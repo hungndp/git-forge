@@ -350,7 +350,7 @@ function contents(forge: Forge, repo: RepoRec, path: string, req: RestRequest): 
       const result = forge.writeFile(repo, branch, path, content, message);
       const name = path.split('/').pop() ?? path;
       return jsonReply(created ? 201 : 200, {
-        content: { name, path, sha: result.blob, size: content.length, type: 'file' },
+        content: { name, path, sha: result.blob, size: content.length, type: 'file', encoding: 'base64' },
         commit: { sha: result.commit, message },
       });
     }

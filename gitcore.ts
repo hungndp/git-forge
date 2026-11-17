@@ -319,7 +319,6 @@ export function selectFetchObjects(
   const boundary: string[] = [];
   const unshallow: string[] = [];
   const wantCommits = wants.map((oid) => peelToCommit(store, oid)).filter((oid) => store.get(oid)?.type === 'commit');
-  for (const want of wants) if (store.has(want)) oids.add(want);
 
   if (depth !== null && depth > 0) {
     const generations = new Map<string, number>();
@@ -334,15 +333,30 @@ export function selectFetchObjects(
       included.push(oid);
       for (const parent of parseCommit(obj.data).parents) queue.push({ oid: parent, depth: at + 1 });
     }
+    // The client already holds its declared shallow commits and their trees: never re-send those,
+    // so a fetch that asks for nothing new answers an empty pack.
+    const held = new Set<string>();
+    for (const shallow of clientShallow) {
+      const obj = store.get(shallow);
+      if (obj !== undefined && obj.type === 'commit') {
+        held.add(shallow);
+        for (const sub of reachableObjects(store, [parseCommit(obj.data).tree])) held.add(sub);
+      }
+    }
     for (const oid of included) {
-      oids.add(oid);
+      if (!held.has(oid)) oids.add(oid);
       const info = parseCommit(store.get(oid)!.data);
-      for (const sub of reachableObjects(store, [info.tree])) oids.add(sub);
+      for (const sub of reachableObjects(store, [info.tree])) if (!held.has(sub)) oids.add(sub);
       if (generations.get(oid) === depth - 1 && info.parents.length > 0) boundary.push(oid);
     }
     const boundarySet = new Set(boundary);
     for (const shallow of clientShallow) {
       if (generations.has(shallow) && !boundarySet.has(shallow)) unshallow.push(shallow);
+    }
+    // A want that names an annotated tag delivers the tag object too, when its commit is included.
+    for (const want of wants) {
+      const obj = store.get(want);
+      if (obj !== undefined && obj.type === 'tag' && generations.has(peelToCommit(store, want))) oids.add(want);
     }
     return { oids, boundary, unshallow };
   }
