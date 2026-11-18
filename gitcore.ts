@@ -29,15 +29,31 @@ export function isOid(value: unknown): value is string {
 /** The in-memory object store. One per forge; objects are immutable and shared by every repo. */
 export class ObjectStore {
   private readonly objects = new Map<string, GitObj>();
+  private generationCounter = 0;
+
+  /**
+   * Bumped whenever a NEW object enters the store. Stored objects are immutable, so a
+   * result computed over the store's contents stays valid exactly while the generation
+   * does — the fetch-pack memo below keys on it.
+   */
+  get generation(): number {
+    return this.generationCounter;
+  }
 
   put(type: ObjType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data });
+      this.generationCounter += 1;
+    }
     return oid;
   }
 
   putKnown(oid: string, type: ObjType, data: Buffer): void {
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    if (!this.objects.has(oid)) {
+      this.objects.set(oid, { type, data });
+      this.generationCounter += 1;
+    }
   }
 
   get(oid: string): GitObj | undefined {
@@ -415,6 +431,51 @@ export function selectFetchObjects(
     if (!excluded.has(oid)) oids.add(oid);
   }
   return { oids, boundary, unshallow };
+}
+
+
+/**
+ * selectFetchObjects + writePack, memoised. The selection is a pure function of the wants,
+ * haves, client shallows and depth over the object graph, and stored objects are immutable
+ * and content-addressed: reachability from a given oid can never change as the store grows,
+ * so a repeated fetch (a clone fleet asks the same question dozens of times) recomputes —
+ * and re-deflates — the identical pack on every request. The one stateful input is
+ * EXISTENCE (a want naming an object the store lacks is filtered out of the selection),
+ * so the memo key carries the store generation, which bumps on every new object: a hit is
+ * only ever served against the exact object set the entry was computed from, and the bytes
+ * served are the very bytes the unmemoised path produced for them.
+ */
+const fetchPackMemos = new WeakMap<ObjectStore, Map<string, { selection: FetchSelection; pack: Buffer }>>();
+const FETCH_PACK_MEMO_LIMIT = 32;
+const FETCH_PACK_MEMO_MAX_BYTES = 4 * 1024 * 1024;
+
+export function selectAndPackFetch(
+  store: ObjectStore,
+  wants: readonly string[],
+  haves: readonly string[],
+  clientShallow: readonly string[],
+  depth: number | null,
+): { selection: FetchSelection; pack: Buffer } {
+  let memo = fetchPackMemos.get(store);
+  if (memo === undefined) {
+    memo = new Map();
+    fetchPackMemos.set(store, memo);
+  }
+  const key = [store.generation, depth ?? '-', wants.join(','), haves.join(','), clientShallow.join(',')].join('|');
+  const hit = memo.get(key);
+  if (hit !== undefined) {
+    return {
+      selection: { oids: new Set(hit.selection.oids), boundary: [...hit.selection.boundary], unshallow: [...hit.selection.unshallow] },
+      pack: hit.pack,
+    };
+  }
+  const selection = selectFetchObjects(store, wants, haves, clientShallow, depth);
+  const pack = writePack(store, selection.oids);
+  if (pack.length <= FETCH_PACK_MEMO_MAX_BYTES) {
+    memo.set(key, { selection: { oids: new Set(selection.oids), boundary: [...selection.boundary], unshallow: [...selection.unshallow] }, pack });
+    while (memo.size > FETCH_PACK_MEMO_LIMIT) memo.delete(memo.keys().next().value!);
+  }
+  return { selection, pack };
 }
 
 // ---------------------------------------------------------------- tree diff and merge

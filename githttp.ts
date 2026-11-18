@@ -13,8 +13,7 @@ import {
   pktFlush,
   pktLine,
   readPackInto,
-  selectFetchObjects,
-  writePack,
+  selectAndPackFetch,
 } from './gitcore.ts';
 import { Forge, type RepoRec } from './store.ts';
 import { errorReply, rawReply, type Reply } from './web.ts';
@@ -178,8 +177,7 @@ function fetchV2(forge: Forge, repo: RepoRec, reader: PktReader): Reply {
     parts.push(pktFlush());
     return rawReply(200, Buffer.concat(parts), 'application/x-git-upload-pack-result');
   }
-  const selection = selectFetchObjects(forge.objects, args.wants, args.haves, args.shallow, args.depth);
-  const pack = writePack(forge.objects, selection.oids);
+  const { selection, pack } = selectAndPackFetch(forge.objects, args.wants, args.haves, args.shallow, args.depth);
   // Protocol v2 response sections, separated by delim packets; one flush ends the response.
   const parts: Buffer[] = [];
   if (args.depth !== null || selection.boundary.length > 0 || selection.unshallow.length > 0) {
@@ -213,8 +211,7 @@ function fetchV0(forge: Forge, repo: RepoRec, reader: PktReader): Reply {
     else if (line.startsWith('have ')) args.haves.push(line.slice(5).trim());
     else if (line === 'done') args.done = true;
   }
-  const selection = selectFetchObjects(forge.objects, args.wants, args.haves, args.shallow, args.depth);
-  const pack = writePack(forge.objects, selection.oids);
+  const { selection, pack } = selectAndPackFetch(forge.objects, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [];
   for (const oid of selection.boundary) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of selection.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
