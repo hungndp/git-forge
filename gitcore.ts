@@ -77,6 +77,21 @@ export function parseCommit(data: Buffer): CommitInfo {
   return { tree, parents, author, committer, message };
 }
 
+/**
+ * parseCommit with a memo on the buffer itself. Stored objects are immutable, so a stored
+ * buffer's parse never changes; the WeakMap lets the memo die with the object. Every caller
+ * treats a parse as read-only (the audit is in PERF-NOTES.md), so sharing one is safe.
+ */
+const commitInfoMemo = new WeakMap<Buffer, CommitInfo>();
+
+export function parseCommitMemo(data: Buffer): CommitInfo {
+  const hit = commitInfoMemo.get(data);
+  if (hit !== undefined) return hit;
+  const parsed = parseCommit(data);
+  commitInfoMemo.set(data, parsed);
+  return parsed;
+}
+
 export function buildCommitData(tree: string, parents: readonly string[], author: string, committer: string, message: string): Buffer {
   let head = `tree ${tree}\n`;
   for (const parent of parents) head += `parent ${parent}\n`;
@@ -117,6 +132,17 @@ export function parseTree(data: Buffer): TreeEntry[] {
   return entries;
 }
 
+/** parseTree with the same buffer memo as parseCommitMemo; results are read-only to callers. */
+const treeEntriesMemo = new WeakMap<Buffer, TreeEntry[]>();
+
+export function parseTreeMemo(data: Buffer): TreeEntry[] {
+  const hit = treeEntriesMemo.get(data);
+  if (hit !== undefined) return hit;
+  const parsed = parseTree(data);
+  treeEntriesMemo.set(data, parsed);
+  return parsed;
+}
+
 function treeSortKey(entry: TreeEntry): string {
   return entry.mode === '40000' ? `${entry.name}/` : entry.name;
 }
@@ -140,7 +166,7 @@ export interface FlatEntry {
 export function flattenTree(store: ObjectStore, treeOid: string, prefix = '', out = new Map<string, FlatEntry>()): Map<string, FlatEntry> {
   const obj = store.get(treeOid);
   if (obj === undefined || obj.type !== 'tree') return out;
-  for (const entry of parseTree(obj.data)) {
+  for (const entry of parseTreeMemo(obj.data)) {
     const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
     if (entry.mode === '40000') flattenTree(store, entry.oid, path, out);
     else out.set(path, { mode: entry.mode, oid: entry.oid });
@@ -186,7 +212,7 @@ export function lookupPath(store: ObjectStore, treeOid: string, path: string): {
   for (let i = 0; i < parts.length; i += 1) {
     const obj = store.get(current);
     if (obj === undefined || obj.type !== 'tree') return undefined;
-    const entry = parseTree(obj.data).find((candidate) => candidate.name === parts[i]);
+    const entry = parseTreeMemo(obj.data).find((candidate) => candidate.name === parts[i]);
     if (entry === undefined) return undefined;
     if (i === parts.length - 1) {
       return entry.mode === '40000' ? { mode: entry.mode, oid: entry.oid, type: 'tree' } : { mode: entry.mode, oid: entry.oid, type: 'blob' };
@@ -223,21 +249,44 @@ export function peelToCommit(store: ObjectStore, oid: string): string {
 export function ancestorsOf(store: ObjectStore, tip: string): Map<string, number> {
   const distances = new Map<string, number>();
   if (!isOid(tip) || tip === ZERO_OID) return distances;
-  const queue: Array<{ oid: string; depth: number }> = [{ oid: peelToCommit(store, tip), depth: 0 }];
-  while (queue.length > 0) {
-    const { oid, depth } = queue.shift()!;
-    if (distances.has(oid)) continue;
+  // Breadth-first with a head index instead of shift() (same FIFO order, no array copying),
+  // de-duplicated at push time: a commit's first push is its shallowest, because parents are
+  // processed in nondecreasing depth order, so the distance recorded is unchanged.
+  const seen = new Set<string>();
+  const start = peelToCommit(store, tip);
+  seen.add(start);
+  const queue: Array<{ oid: string; depth: number }> = [{ oid: start, depth: 0 }];
+  for (let head = 0; head < queue.length; head += 1) {
+    const { oid, depth } = queue[head]!;
     const obj = store.get(oid);
     if (obj === undefined || obj.type !== 'commit') continue;
     distances.set(oid, depth);
-    for (const parent of parseCommit(obj.data).parents) queue.push({ oid: parent, depth: depth + 1 });
+    for (const parent of parseCommitMemo(obj.data).parents) {
+      if (seen.has(parent)) continue;
+      seen.add(parent);
+      queue.push({ oid: parent, depth: depth + 1 });
+    }
   }
   return distances;
 }
 
 export function isAncestor(store: ObjectStore, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return ancestorsOf(store, descendant).has(ancestor);
+  // The same reachability question ancestorsOf answers, but the walk stops the moment the
+  // ancestor turns up (a push's fast-forward check names the direct parent: one hop). Only
+  // commit objects count as found, exactly as the ancestors map only ever holds commits.
+  const seen = new Set<string>();
+  const stack: string[] = [peelToCommit(store, descendant)];
+  while (stack.length > 0) {
+    const oid = stack.pop()!;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const obj = store.get(oid);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    if (oid === ancestor) return true;
+    for (const parent of parseCommitMemo(obj.data).parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** A best common ancestor of two commits (the one minimising the summed distance), or null. */
@@ -281,11 +330,11 @@ export function reachableObjects(store: ObjectStore, tips: readonly string[]): S
     if (obj === undefined) continue;
     seen.add(oid);
     if (obj.type === 'commit') {
-      const info = parseCommit(obj.data);
+      const info = parseCommitMemo(obj.data);
       stack.push(info.tree);
       for (const parent of info.parents) stack.push(parent);
     } else if (obj.type === 'tree') {
-      for (const entry of parseTree(obj.data)) stack.push(entry.oid);
+      for (const entry of parseTreeMemo(obj.data)) stack.push(entry.oid);
     } else if (obj.type === 'tag') {
       const target = parseTagTarget(obj.data);
       if (target !== '') stack.push(target);
@@ -324,14 +373,14 @@ export function selectFetchObjects(
     const generations = new Map<string, number>();
     const queue: Array<{ oid: string; depth: number }> = wantCommits.map((oid) => ({ oid, depth: 0 }));
     const included: string[] = [];
-    while (queue.length > 0) {
-      const { oid, depth: at } = queue.shift()!;
+    for (let head = 0; head < queue.length; head += 1) {
+      const { oid, depth: at } = queue[head]!;
       if (generations.has(oid) || at >= depth) continue;
       const obj = store.get(oid);
       if (obj === undefined || obj.type !== 'commit') continue;
       generations.set(oid, at);
       included.push(oid);
-      for (const parent of parseCommit(obj.data).parents) queue.push({ oid: parent, depth: at + 1 });
+      for (const parent of parseCommitMemo(obj.data).parents) queue.push({ oid: parent, depth: at + 1 });
     }
     // The client already holds its declared shallow commits and their trees: never re-send those,
     // so a fetch that asks for nothing new answers an empty pack.
@@ -340,12 +389,12 @@ export function selectFetchObjects(
       const obj = store.get(shallow);
       if (obj !== undefined && obj.type === 'commit') {
         held.add(shallow);
-        for (const sub of reachableObjects(store, [parseCommit(obj.data).tree])) held.add(sub);
+        for (const sub of reachableObjects(store, [parseCommitMemo(obj.data).tree])) held.add(sub);
       }
     }
     for (const oid of included) {
       if (!held.has(oid)) oids.add(oid);
-      const info = parseCommit(store.get(oid)!.data);
+      const info = parseCommitMemo(store.get(oid)!.data);
       for (const sub of reachableObjects(store, [info.tree])) if (!held.has(sub)) oids.add(sub);
       if (generations.get(oid) === depth - 1 && info.parents.length > 0) boundary.push(oid);
     }
@@ -606,6 +655,20 @@ export function readPackInto(store: ObjectStore, pack: Buffer): string[] {
   }
   const byOffset = new Map<number, PackEntry>();
   for (const entry of entries) byOffset.set(entry.offset, entry);
+  // A REF_DELTA whose base is not in the store is carried by a plain entry of this same pack:
+  // index those by object id once, instead of re-hashing every candidate for every delta
+  // (the entries it finds hold the same type and bytes the linear scan found, so the base
+  // it resolves to is the same object).
+  let byOid: Map<string, PackEntry> | null = null;
+  const carrierOf = (oid: string): PackEntry | undefined => {
+    if (byOid === null) {
+      byOid = new Map();
+      for (const entry of entries) {
+        if (entry.data !== undefined && !byOid.has(hashObject(entry.type, entry.data))) byOid.set(hashObject(entry.type, entry.data), entry);
+      }
+    }
+    return byOid.get(oid);
+  };
   const resolved = new Map<PackEntry, { oid: string; type: ObjType; data: Buffer }>();
   const resolve = (entry: PackEntry): { oid: string; type: ObjType; data: Buffer } => {
     const done = resolved.get(entry);
@@ -618,7 +681,7 @@ export function readPackInto(store: ObjectStore, pack: Buffer): string[] {
       if (entry.deltaBaseOid !== undefined) {
         base = store.get(entry.deltaBaseOid);
         if (base === undefined) {
-          const carrier = entries.find((candidate) => candidate.data !== undefined && hashObject(candidate.type, candidate.data) === entry.deltaBaseOid);
+          const carrier = carrierOf(entry.deltaBaseOid);
           if (carrier !== undefined) base = resolve(carrier);
         }
       } else if (entry.deltaBaseOffset !== undefined) {
