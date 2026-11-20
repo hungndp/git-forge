@@ -596,16 +596,23 @@ export function writePack(store: ObjectStore, oids: Iterable<string>): Buffer {
   header.write('PACK', 0, 'utf8');
   header.writeUInt32BE(2, 4);
   header.writeUInt32BE(list.length, 8);
+  // One concat for the whole pack, and the trailer hash fed incrementally over the same
+  // parts: the bytes are exactly header + objects + sha1(everything before it), without
+  // copying the body twice to hash it.
   const parts: Buffer[] = [header];
+  const hash = createHash('sha1');
+  hash.update(header);
   for (const oid of list) {
     const obj = store.get(oid);
     if (obj === undefined) continue;
-    parts.push(packObjectHeader(obj.type, obj.data.length));
-    parts.push(deflateSync(obj.data));
+    const objectHeader = packObjectHeader(obj.type, obj.data.length);
+    const body = deflateSync(obj.data);
+    hash.update(objectHeader);
+    hash.update(body);
+    parts.push(objectHeader, body);
   }
-  const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  parts.push(hash.digest());
+  return Buffer.concat(parts);
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -769,12 +776,38 @@ export function readPackInto(store: ObjectStore, pack: Buffer): string[] {
 
 export const PKT_MAX = 65520;
 
+const HEX_DIGITS = '0123456789abcdef';
+
+/** The 4-hex-digit pkt-line length header written straight into `out` at `offset`. */
+function writePktHeader(out: Buffer, offset: number, length: number): void {
+  out[offset] = HEX_DIGITS.charCodeAt((length >> 12) & 0xf);
+  out[offset + 1] = HEX_DIGITS.charCodeAt((length >> 8) & 0xf);
+  out[offset + 2] = HEX_DIGITS.charCodeAt((length >> 4) & 0xf);
+  out[offset + 3] = HEX_DIGITS.charCodeAt(length & 0xf);
+}
+
 export function pktLine(payload: string | Buffer): Buffer {
-  const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const length = body.length + 4;
+  // One allocation for header + payload: the framing is on every git response's hot path,
+  // and the concat-of-two-buffers shape cost a copy of each line for no benefit.
+  const bodyLength = typeof payload === 'string' ? Buffer.byteLength(payload, 'utf8') : payload.length;
+  const length = bodyLength + 4;
   if (length > PKT_MAX) throw new Error('pkt-line too long');
-  const header = Buffer.from(length.toString(16).padStart(4, '0'), 'utf8');
-  return Buffer.concat([header, body]);
+  const out = Buffer.allocUnsafe(length);
+  writePktHeader(out, 0, length);
+  if (typeof payload === 'string') out.write(payload, 4, 'utf8');
+  else payload.copy(out, 4);
+  return out;
+}
+
+/** A pkt-line whose payload is the side-band channel byte 1 followed by `payload` (pack/report framing). */
+export function pktLineBand1(payload: Buffer): Buffer {
+  const length = payload.length + 5;
+  if (length > PKT_MAX) throw new Error('pkt-line too long');
+  const out = Buffer.allocUnsafe(length);
+  writePktHeader(out, 0, length);
+  out[4] = 1;
+  payload.copy(out, 5);
+  return out;
 }
 
 export function pktFlush(): Buffer {
@@ -801,9 +834,18 @@ export class PktReader {
 
   next(): Pkt | null {
     if (this.offset + 4 > this.buffer.length) return null;
-    const header = this.buffer.toString('utf8', this.offset, this.offset + 4);
-    if (!/^[0-9a-f]{4}$/.test(header)) throw new Error(`bad pkt-line header ${JSON.stringify(header)}`);
-    const length = parseInt(header, 16);
+    // The length header parsed from char codes: a regex + string slice per packet was
+    // measurable when a single request carries dozens of packets.
+    let length = 0;
+    for (let i = 0; i < 4; i += 1) {
+      const code = this.buffer[this.offset + i]!;
+      const digit = code >= 0x30 && code <= 0x39 ? code - 0x30 : code >= 0x61 && code <= 0x66 ? code - 0x61 + 10 : -1;
+      if (digit === -1) {
+        const header = this.buffer.toString('utf8', this.offset, this.offset + 4);
+        throw new Error(`bad pkt-line header ${JSON.stringify(header)}`);
+      }
+      length = (length << 4) | digit;
+    }
     if (length === 0) {
       this.offset += 4;
       return { kind: 'flush', payload: Buffer.alloc(0) };

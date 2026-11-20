@@ -44,11 +44,14 @@ function sendReply(res: ServerResponse, reply: Reply, requestId: string): void {
     return;
   }
   const text = `${JSON.stringify(reply.body)}\n`;
-  res.writeHead(reply.status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+  const buffer = Buffer.from(text, 'utf8');
+  res.writeHead(reply.status, { 'content-type': JSON_TYPE, 'content-length': buffer.length, ...headers });
+  res.end(buffer);
 }
 
 function decodeSegment(segment: string): string {
+  // Most segments carry no escape at all; decodeURIComponent's try/catch is for the rest.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -61,6 +64,9 @@ function authorized(req: IncomingMessage, expectedToken: string): boolean {
   if (expectedToken === '') return true;
   const header = req.headers.authorization;
   if (typeof header !== 'string') return false;
+  // The canonical shape the suite's clients send, checked without the regex; anything
+  // odder (extra spaces, different case) falls through to the original test unchanged.
+  if (header === `Bearer ${expectedToken}`) return true;
   const match = /^Bearer\s+(.+)$/i.exec(header.trim());
   return match !== null && match[1] === expectedToken;
 }

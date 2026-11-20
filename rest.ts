@@ -26,7 +26,7 @@ import {
   type PullRec,
   type RepoRec,
 } from './store.ts';
-import { INVALID_JSON, boolField, errorReply, isRecord, jsonReply, pageParams, pageSlice, parseJsonBody, stringField, type Reply } from './web.ts';
+import { INVALID_JSON, boolField, errorReply, isRecord, jsonReply, pageParams, pageSlice, parseJsonBody, rawReply, stringField, type Reply } from './web.ts';
 
 export interface RestRequest {
   method: string;
@@ -397,6 +397,31 @@ function labels(forge: Forge, repo: RepoRec, rest: string[], req: RestRequest): 
 
 // ---------------------------------------------------------------- issues
 
+const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
+
+/**
+ * The serialised body of a single-issue GET, memoised per issue record. The read
+ * benchmark hammers one warm issue thousands of times; rebuilding its JSON object and
+ * re-stringifying it per request was pure repetition. The stamp names everything the
+ * body is computed from: the repo's name/owner (they appear in the body's urls, and a
+ * rename moves them), the issue's updatedAt (every mutation path — REST PATCH, GraphQL
+ * close — bumps it through the logical clock, so it versions the issue's own fields),
+ * the comment count (comments only ever append), and the label definitions the issue
+ * carries (labels are immutable once created). A stamp match therefore means the body
+ * is byte-identical to a fresh render, and a mismatch simply re-renders.
+ */
+const issueTextCache = new WeakMap<IssueRec, { stamp: string; text: string }>();
+
+function issueStamp(repo: RepoRec, issue: IssueRec): string {
+  let labels = '';
+  for (const name of issue.labels) {
+    const label = repo.labels.get(name);
+    labels += label === undefined ? `${name}=;` : `${name}=${label.color},${String(label.description)};`;
+  }
+  const comments = (repo.comments.get(issue.number) ?? []).length;
+  return `${repo.owner}/${repo.name}|${issue.updatedAt}|${comments}|${labels}`;
+}
+
 function sortIssues(list: IssueRec[], query: URLSearchParams): IssueRec[] {
   const direction = query.get('direction') ?? 'desc';
   const sorted = [...list].sort((a, b) => a.number - b.number);
@@ -436,7 +461,14 @@ function issues(forge: Forge, repo: RepoRec, rest: string[], req: RestRequest): 
 
   if (rest.length === 1) {
     if (issue === undefined) return NOT_FOUND();
-    if (req.method === 'GET') return jsonReply(200, issueJson(forge, repo, issue));
+    if (req.method === 'GET') {
+      const stamp = issueStamp(repo, issue);
+      const hit = issueTextCache.get(issue);
+      if (hit !== undefined && hit.stamp === stamp) return rawReply(200, Buffer.from(hit.text, 'utf8'), JSON_CONTENT_TYPE);
+      const body = issueJson(forge, repo, issue);
+      issueTextCache.set(issue, { stamp, text: `${JSON.stringify(body)}\n` });
+      return jsonReply(200, body);
+    }
     if (req.method === 'PATCH') {
       const parsed = requireBody(req);
       if ('reply' in parsed) return parsed.reply;

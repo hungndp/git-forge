@@ -12,6 +12,7 @@ import {
   pktDelim,
   pktFlush,
   pktLine,
+  pktLineBand1,
   readPackInto,
   selectAndPackFetch,
 } from './gitcore.ts';
@@ -138,12 +139,12 @@ function sidebandPack(pack: Buffer): Buffer[] {
   const parts: Buffer[] = [];
   const CHUNK = 65515;
   if (pack.length === 0) {
-    parts.push(pktLine(Buffer.concat([Buffer.from([1])])));
+    parts.push(pktLineBand1(Buffer.alloc(0)));
     return parts;
   }
   for (let offset = 0; offset < pack.length; offset += CHUNK) {
     const chunk = pack.subarray(offset, Math.min(pack.length, offset + CHUNK));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+    parts.push(pktLineBand1(chunk));
   }
   return parts;
 }
@@ -282,8 +283,8 @@ function receivePack(forge: Forge, repo: RepoRec, rawBody: Buffer): Reply {
   // The report-status stream is itself pkt-lined inside band 1: each band-1 packet carries one
   // inner pkt-line, the inner stream ends with its own flush inside band 1, and a final outer
   // flush closes the sideband stream.
-  const parts: Buffer[] = report.map((line) => pktLine(Buffer.concat([Buffer.from([1]), pktLine(line)])));
-  parts.push(pktLine(Buffer.concat([Buffer.from([1]), pktFlush()])));
+  const parts: Buffer[] = report.map((line) => pktLineBand1(pktLine(line)));
+  parts.push(pktLineBand1(pktFlush()));
   parts.push(pktFlush());
   return rawReply(200, Buffer.concat(parts), 'application/x-git-receive-pack-result');
 }
